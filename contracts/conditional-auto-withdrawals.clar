@@ -7,6 +7,10 @@
 (define-constant err-already-withdrawn (err u105))
 (define-constant err-invalid-amount (err u106))
 (define-constant err-invalid-condition (err u107))
+(define-constant err-not-authorized (err u108))
+(define-constant err-escrow-not-active (err u109))
+(define-constant err-escrow-completed (err u110))
+(define-constant err-timeout-not-reached (err u111))
 
 (define-map withdrawal-conditions
   { condition-id: uint }
@@ -333,3 +337,128 @@
     (let ((remaining-payments (- (get total-payments payment-data) (get payments-made payment-data))))
       (some (* remaining-payments (get amount payment-data))))
     none))
+
+(define-map escrow-agreements
+  { escrow-id: uint }
+  {
+    buyer: principal,
+    seller: principal,
+    amount: uint,
+    timeout-block: uint,
+    buyer-approved: bool,
+    seller-approved: bool,
+    is-completed: bool,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var next-escrow-id uint u1)
+
+(define-public (create-escrow (seller principal) (amount uint) (timeout-blocks uint))
+  (let ((escrow-id (var-get next-escrow-id))
+        (buyer-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender })))))
+    (if (and (> amount u0) (>= buyer-balance amount) (> timeout-blocks u0))
+      (begin
+        (map-set escrow-agreements
+          { escrow-id: escrow-id }
+          {
+            buyer: tx-sender,
+            seller: seller,
+            amount: amount,
+            timeout-block: (+ stacks-block-height timeout-blocks),
+            buyer-approved: false,
+            seller-approved: false,
+            is-completed: false,
+            is-active: true,
+            created-at: stacks-block-height
+          })
+        (map-set user-balances 
+          { user: tx-sender } 
+          { balance: (- buyer-balance amount) })
+        (var-set next-escrow-id (+ escrow-id u1))
+        (ok escrow-id))
+      err-insufficient-funds)))
+
+(define-public (approve-escrow (escrow-id uint))
+  (match (map-get? escrow-agreements { escrow-id: escrow-id })
+    escrow-data
+    (if (and (get is-active escrow-data) (not (get is-completed escrow-data)))
+      (let ((is-buyer (is-eq tx-sender (get buyer escrow-data)))
+            (is-seller (is-eq tx-sender (get seller escrow-data)))
+            (new-buyer-approved (if is-buyer true (get buyer-approved escrow-data)))
+            (new-seller-approved (if is-seller true (get seller-approved escrow-data))))
+        (if (or is-buyer is-seller)
+          (begin
+            (map-set escrow-agreements
+              { escrow-id: escrow-id }
+              (merge escrow-data { 
+                buyer-approved: new-buyer-approved, 
+                seller-approved: new-seller-approved 
+              }))
+            (ok true))
+          err-not-authorized))
+      err-escrow-not-active)
+    err-not-found))
+
+(define-public (release-escrow (escrow-id uint))
+  (match (map-get? escrow-agreements { escrow-id: escrow-id })
+    escrow-data
+    (if (and 
+          (get is-active escrow-data)
+          (not (get is-completed escrow-data))
+          (get buyer-approved escrow-data)
+          (get seller-approved escrow-data))
+      (let ((seller-balance (default-to u0 (get balance (map-get? user-balances { user: (get seller escrow-data) })))))
+        (map-set escrow-agreements
+          { escrow-id: escrow-id }
+          (merge escrow-data { is-completed: true, is-active: false }))
+        (map-set user-balances 
+          { user: (get seller escrow-data) } 
+          { balance: (+ seller-balance (get amount escrow-data)) })
+        (ok (get amount escrow-data)))
+      err-not-authorized)
+    err-not-found))
+
+(define-public (refund-escrow (escrow-id uint))
+  (match (map-get? escrow-agreements { escrow-id: escrow-id })
+    escrow-data
+    (if (and 
+          (get is-active escrow-data)
+          (not (get is-completed escrow-data))
+          (>= stacks-block-height (get timeout-block escrow-data)))
+      (let ((buyer-balance (default-to u0 (get balance (map-get? user-balances { user: (get buyer escrow-data) })))))
+        (map-set escrow-agreements
+          { escrow-id: escrow-id }
+          (merge escrow-data { is-completed: true, is-active: false }))
+        (map-set user-balances 
+          { user: (get buyer escrow-data) } 
+          { balance: (+ buyer-balance (get amount escrow-data)) })
+        (ok (get amount escrow-data)))
+      err-timeout-not-reached)
+    err-not-found))
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrow-agreements { escrow-id: escrow-id }))
+
+(define-read-only (get-next-escrow-id)
+  (var-get next-escrow-id))
+
+(define-read-only (is-escrow-ready-for-release (escrow-id uint))
+  (match (map-get? escrow-agreements { escrow-id: escrow-id })
+    escrow-data
+    (and 
+      (get is-active escrow-data)
+      (not (get is-completed escrow-data))
+      (get buyer-approved escrow-data)
+      (get seller-approved escrow-data))
+    false))
+
+(define-read-only (is-escrow-refundable (escrow-id uint))
+  (match (map-get? escrow-agreements { escrow-id: escrow-id })
+    escrow-data
+    (and 
+      (get is-active escrow-data)
+      (not (get is-completed escrow-data))
+      (>= stacks-block-height (get timeout-block escrow-data)))
+    false))
