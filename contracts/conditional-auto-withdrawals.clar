@@ -11,6 +11,9 @@
 (define-constant err-escrow-not-active (err u109))
 (define-constant err-escrow-completed (err u110))
 (define-constant err-timeout-not-reached (err u111))
+(define-constant err-savings-locked (err u112))
+(define-constant err-early-withdrawal-penalty (err u113))
+(define-constant err-invalid-duration (err u114))
 
 (define-map withdrawal-conditions
   { condition-id: uint }
@@ -462,3 +465,128 @@
       (not (get is-completed escrow-data))
       (>= stacks-block-height (get timeout-block escrow-data)))
     false))
+
+(define-map savings-accounts
+  { savings-id: uint }
+  {
+    owner: principal,
+    principal-amount: uint,
+    lock-duration: uint,
+    maturity-block: uint,
+    reward-rate: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var next-savings-id uint u1)
+(define-data-var total-savings-locked uint u0)
+
+(define-public (create-savings-account (amount uint) (lock-duration uint))
+  (let ((savings-id (var-get next-savings-id))
+        (owner-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender }))))
+        (reward-rate (calculate-reward-rate lock-duration))
+        (maturity-block (+ stacks-block-height lock-duration)))
+    (if (and (> amount u0) (>= owner-balance amount) (>= lock-duration u1000))
+      (begin
+        (map-set savings-accounts
+          { savings-id: savings-id }
+          {
+            owner: tx-sender,
+            principal-amount: amount,
+            lock-duration: lock-duration,
+            maturity-block: maturity-block,
+            reward-rate: reward-rate,
+            is-active: true,
+            created-at: stacks-block-height
+          })
+        (map-set user-balances 
+          { user: tx-sender } 
+          { balance: (- owner-balance amount) })
+        (var-set total-savings-locked (+ (var-get total-savings-locked) amount))
+        (var-set next-savings-id (+ savings-id u1))
+        (ok savings-id))
+      (if (< lock-duration u1000)
+        err-invalid-duration
+        err-insufficient-funds))))
+
+(define-public (withdraw-savings (savings-id uint))
+  (match (map-get? savings-accounts { savings-id: savings-id })
+    savings-data
+    (if (and (is-eq tx-sender (get owner savings-data)) (get is-active savings-data))
+      (let ((is-matured (>= stacks-block-height (get maturity-block savings-data)))
+            (principal-amount (get principal-amount savings-data))
+            (total-payout (if is-matured 
+                            (calculate-total-payout savings-data) 
+                            (calculate-early-withdrawal-amount savings-data)))
+            (owner-balance (default-to u0 (get balance (map-get? user-balances { user: (get owner savings-data) })))))
+        (map-set savings-accounts
+          { savings-id: savings-id }
+          (merge savings-data { is-active: false }))
+        (map-set user-balances 
+          { user: (get owner savings-data) } 
+          { balance: (+ owner-balance total-payout) })
+        (var-set total-savings-locked (- (var-get total-savings-locked) principal-amount))
+        (ok total-payout))
+      err-not-authorized)
+    err-not-found))
+
+(define-private (calculate-reward-rate (duration uint))
+  (if (>= duration u5000)
+    u10
+    (if (>= duration u3000)
+      u7
+      (if (>= duration u1000)
+        u5
+        u0))))
+
+(define-private (calculate-total-payout (savings-data (tuple (owner principal) (principal-amount uint) (lock-duration uint) (maturity-block uint) (reward-rate uint) (is-active bool) (created-at uint))))
+  (let ((principal (get principal-amount savings-data))
+        (rate (get reward-rate savings-data)))
+    (+ principal (/ (* principal rate) u100))))
+
+(define-private (calculate-early-withdrawal-amount (savings-data (tuple (owner principal) (principal-amount uint) (lock-duration uint) (maturity-block uint) (reward-rate uint) (is-active bool) (created-at uint))))
+  (let ((principal (get principal-amount savings-data))
+        (penalty-rate u15))
+    (- principal (/ (* principal penalty-rate) u100))))
+
+(define-read-only (get-savings-account (savings-id uint))
+  (map-get? savings-accounts { savings-id: savings-id }))
+
+(define-read-only (get-next-savings-id)
+  (var-get next-savings-id))
+
+(define-read-only (get-total-savings-locked)
+  (var-get total-savings-locked))
+
+(define-read-only (is-savings-matured (savings-id uint))
+  (match (map-get? savings-accounts { savings-id: savings-id })
+    savings-data
+    (and 
+      (get is-active savings-data)
+      (>= stacks-block-height (get maturity-block savings-data)))
+    false))
+
+(define-read-only (calculate-projected-return (savings-id uint))
+  (match (map-get? savings-accounts { savings-id: savings-id })
+    savings-data
+    (if (get is-active savings-data)
+      (some (calculate-total-payout savings-data))
+      none)
+    none))
+
+(define-read-only (get-savings-details-for-display (savings-id uint))
+  (match (map-get? savings-accounts { savings-id: savings-id })
+    savings-data
+    (let ((is-matured (>= stacks-block-height (get maturity-block savings-data)))
+          (projected-return (calculate-total-payout savings-data)))
+      (some {
+        owner: (get owner savings-data),
+        amount: (get principal-amount savings-data),
+        maturity-block: (get maturity-block savings-data),
+        reward-rate: (get reward-rate savings-data),
+        is-matured: is-matured,
+        projected-return: projected-return,
+        is-active: (get is-active savings-data)
+      }))
+    none))
