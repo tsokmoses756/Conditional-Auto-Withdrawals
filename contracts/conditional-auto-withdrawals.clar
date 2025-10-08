@@ -14,6 +14,12 @@
 (define-constant err-savings-locked (err u112))
 (define-constant err-early-withdrawal-penalty (err u113))
 (define-constant err-invalid-duration (err u114))
+(define-constant err-invalid-signers (err u115))
+(define-constant err-invalid-threshold (err u116))
+(define-constant err-not-signer (err u117))
+(define-constant err-already-approved (err u118))
+(define-constant err-threshold-not-met (err u119))
+(define-constant err-tx-already-executed (err u120))
 
 (define-map withdrawal-conditions
   { condition-id: uint }
@@ -589,4 +595,174 @@
         projected-return: projected-return,
         is-active: (get is-active savings-data)
       }))
+    none))
+
+(define-map multisig-wallets
+  { wallet-id: uint }
+  {
+    signers: (list 10 principal),
+    required-approvals: uint,
+    balance: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map multisig-transactions
+  { tx-id: uint }
+  {
+    wallet-id: uint,
+    recipient: principal,
+    amount: uint,
+    approvals: (list 10 principal),
+    is-executed: bool,
+    created-by: principal,
+    created-at: uint
+  }
+)
+
+(define-data-var next-wallet-id uint u1)
+(define-data-var next-tx-id uint u1)
+
+(define-public (create-multisig-wallet (signers (list 10 principal)) (required-approvals uint))
+  (let ((wallet-id (var-get next-wallet-id))
+        (num-signers (len signers)))
+    (if (and (> num-signers u0) 
+             (<= num-signers u10)
+             (> required-approvals u0)
+             (<= required-approvals num-signers))
+      (begin
+        (map-set multisig-wallets
+          { wallet-id: wallet-id }
+          {
+            signers: signers,
+            required-approvals: required-approvals,
+            balance: u0,
+            is-active: true,
+            created-at: stacks-block-height
+          })
+        (var-set next-wallet-id (+ wallet-id u1))
+        (ok wallet-id))
+      (if (or (is-eq num-signers u0) (> num-signers u10))
+        err-invalid-signers
+        err-invalid-threshold))))
+
+(define-public (deposit-to-multisig (wallet-id uint) (amount uint))
+  (match (map-get? multisig-wallets { wallet-id: wallet-id })
+    wallet-data
+    (if (and (get is-active wallet-data) (> amount u0))
+      (let ((sender-balance (default-to u0 (get balance (map-get? user-balances { user: tx-sender })))))
+        (if (>= sender-balance amount)
+          (begin
+            (map-set user-balances 
+              { user: tx-sender } 
+              { balance: (- sender-balance amount) })
+            (map-set multisig-wallets
+              { wallet-id: wallet-id }
+              (merge wallet-data { balance: (+ (get balance wallet-data) amount) }))
+            (ok amount))
+          err-insufficient-funds))
+      err-invalid-amount)
+    err-not-found))
+
+(define-public (propose-multisig-transaction (wallet-id uint) (recipient principal) (amount uint))
+  (match (map-get? multisig-wallets { wallet-id: wallet-id })
+    wallet-data
+    (if (and (get is-active wallet-data)
+             (is-signer-of-wallet tx-sender (get signers wallet-data))
+             (> amount u0)
+             (<= amount (get balance wallet-data)))
+      (let ((tx-id (var-get next-tx-id)))
+        (map-set multisig-transactions
+          { tx-id: tx-id }
+          {
+            wallet-id: wallet-id,
+            recipient: recipient,
+            amount: amount,
+            approvals: (list tx-sender),
+            is-executed: false,
+            created-by: tx-sender,
+            created-at: stacks-block-height
+          })
+        (var-set next-tx-id (+ tx-id u1))
+        (ok tx-id))
+      err-not-authorized)
+    err-not-found))
+
+(define-public (approve-multisig-transaction (tx-id uint))
+  (match (map-get? multisig-transactions { tx-id: tx-id })
+    tx-data
+    (match (map-get? multisig-wallets { wallet-id: (get wallet-id tx-data) })
+      wallet-data
+      (if (and (not (get is-executed tx-data))
+               (is-signer-of-wallet tx-sender (get signers wallet-data))
+               (not (has-approved tx-sender (get approvals tx-data))))
+        (let ((new-approvals (unwrap! (as-max-len? (append (get approvals tx-data) tx-sender) u10) err-invalid-signers)))
+          (map-set multisig-transactions
+            { tx-id: tx-id }
+            (merge tx-data { approvals: new-approvals }))
+          (ok true))
+        (if (has-approved tx-sender (get approvals tx-data))
+          err-already-approved
+          err-not-signer))
+      err-not-found)
+    err-not-found))
+
+(define-public (execute-multisig-transaction (tx-id uint))
+  (match (map-get? multisig-transactions { tx-id: tx-id })
+    tx-data
+    (match (map-get? multisig-wallets { wallet-id: (get wallet-id tx-data) })
+      wallet-data
+      (if (and (not (get is-executed tx-data))
+               (>= (len (get approvals tx-data)) (get required-approvals wallet-data))
+               (>= (get balance wallet-data) (get amount tx-data)))
+        (let ((recipient-balance (default-to u0 (get balance (map-get? user-balances { user: (get recipient tx-data) })))))
+          (map-set multisig-transactions
+            { tx-id: tx-id }
+            (merge tx-data { is-executed: true }))
+          (map-set multisig-wallets
+            { wallet-id: (get wallet-id tx-data) }
+            (merge wallet-data { balance: (- (get balance wallet-data) (get amount tx-data)) }))
+          (map-set user-balances
+            { user: (get recipient tx-data) }
+            { balance: (+ recipient-balance (get amount tx-data)) })
+          (ok (get amount tx-data)))
+        (if (get is-executed tx-data)
+          err-tx-already-executed
+          err-threshold-not-met))
+      err-not-found)
+    err-not-found))
+
+(define-private (is-signer-of-wallet (user principal) (signers (list 10 principal)))
+  (is-some (index-of signers user)))
+
+(define-private (has-approved (user principal) (approvals (list 10 principal)))
+  (is-some (index-of approvals user)))
+
+(define-read-only (get-multisig-wallet (wallet-id uint))
+  (map-get? multisig-wallets { wallet-id: wallet-id }))
+
+(define-read-only (get-multisig-transaction (tx-id uint))
+  (map-get? multisig-transactions { tx-id: tx-id }))
+
+(define-read-only (get-next-wallet-id)
+  (var-get next-wallet-id))
+
+(define-read-only (get-next-tx-id)
+  (var-get next-tx-id))
+
+(define-read-only (is-transaction-ready (tx-id uint))
+  (match (map-get? multisig-transactions { tx-id: tx-id })
+    tx-data
+    (match (map-get? multisig-wallets { wallet-id: (get wallet-id tx-data) })
+      wallet-data
+      (and (not (get is-executed tx-data))
+           (>= (len (get approvals tx-data)) (get required-approvals wallet-data)))
+      false)
+    false))
+
+(define-read-only (get-transaction-approval-count (tx-id uint))
+  (match (map-get? multisig-transactions { tx-id: tx-id })
+    tx-data
+    (some (len (get approvals tx-data)))
     none))
