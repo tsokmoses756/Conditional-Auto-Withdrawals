@@ -766,3 +766,96 @@
     tx-data
     (some (len (get approvals tx-data)))
     none))
+
+
+(define-constant err-hashlock-invalid (err u130))
+(define-constant err-hashlock-not-active (err u131))
+(define-constant err-hashlock-claimed (err u132))
+(define-constant err-hashlock-timeout-not-reached (err u133))
+(define-constant err-hashlock-not-authorized (err u134))
+
+(define-map hashlock-agreements
+  { lock-id: uint }
+  {
+    creator: principal,
+    beneficiary: principal,
+    amount: uint,
+    hash: (buff 32),
+    timeout-block: uint,
+    is-active: bool,
+    is-claimed: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var next-lock-id uint u1)
+
+(define-public (create-hashlock (beneficiary principal) (amount uint) (hash (buff 32)) (timeout-blocks uint))
+  (let ((lock-id (var-get next-lock-id))
+        (deadline (+ stacks-block-height timeout-blocks)))
+    (if (and (> amount u0) (> timeout-blocks u0))
+      (begin
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set hashlock-agreements
+          { lock-id: lock-id }
+          {
+            creator: tx-sender,
+            beneficiary: beneficiary,
+            amount: amount,
+            hash: hash,
+            timeout-block: deadline,
+            is-active: true,
+            is-claimed: false,
+            created-at: stacks-block-height
+          })
+        (var-set next-lock-id (+ lock-id u1))
+        (ok lock-id))
+      err-invalid-amount)))
+
+(define-public (claim-hashlock (lock-id uint) (preimage (buff 32)))
+  (match (map-get? hashlock-agreements { lock-id: lock-id })
+    lock-data
+    (if (and (get is-active lock-data) (not (get is-claimed lock-data)))
+      (if (is-eq (sha256 preimage) (get hash lock-data))
+        (begin
+          (try! (as-contract (stx-transfer? (get amount lock-data) tx-sender (get beneficiary lock-data))))
+          (map-set hashlock-agreements
+            { lock-id: lock-id }
+            (merge lock-data { is-claimed: true, is-active: false }))
+          (ok (get amount lock-data)))
+        err-hashlock-invalid)
+      (if (get is-claimed lock-data)
+        err-hashlock-claimed
+        err-hashlock-not-active))
+    err-not-found))
+
+(define-public (refund-hashlock (lock-id uint))
+  (match (map-get? hashlock-agreements { lock-id: lock-id })
+    lock-data
+    (if (and (get is-active lock-data) (not (get is-claimed lock-data)))
+      (if (>= stacks-block-height (get timeout-block lock-data))
+        (if (is-eq tx-sender (get creator lock-data))
+          (begin
+            (try! (as-contract (stx-transfer? (get amount lock-data) tx-sender (get creator lock-data))))
+            (map-set hashlock-agreements
+              { lock-id: lock-id }
+              (merge lock-data { is-active: false }))
+            (ok (get amount lock-data)))
+          err-hashlock-not-authorized)
+        err-hashlock-timeout-not-reached)
+      err-hashlock-not-active)
+    err-not-found))
+
+(define-read-only (get-hashlock (lock-id uint))
+  (map-get? hashlock-agreements { lock-id: lock-id }))
+
+(define-read-only (get-next-lock-id)
+  (var-get next-lock-id))
+
+(define-read-only (is-hashlock-claimable (lock-id uint))
+  (match (map-get? hashlock-agreements { lock-id: lock-id })
+    lock-data
+    (and (get is-active lock-data)
+         (not (get is-claimed lock-data))
+         (< stacks-block-height (get timeout-block lock-data)))
+    false))
